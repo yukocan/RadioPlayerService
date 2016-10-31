@@ -14,6 +14,8 @@ import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 import android.support.annotation.Nullable;
+import android.telephony.PhoneStateListener;
+import android.telephony.TelephonyManager;
 import android.widget.RemoteViews;
 
 import java.io.IOException;
@@ -28,23 +30,32 @@ import co.mobiwise.library.R;
 public class MediaPlayerService extends Service implements
         MediaPlayer.OnPreparedListener,
         MediaPlayer.OnSeekCompleteListener,
-        MediaPlayer.OnCompletionListener{
+        MediaPlayer.OnCompletionListener {
 
-
-    /**
-     * Notification ID
-     */
-    private static final int NOTIFICATION_ID = 001;
 
     /**
      * PLAY/PAUSE intent and OPENPLAYER intent strings
      */
     public static final String NOTIFICATION_INTENT_PLAY_PAUSE = "co.mobiwise.library.notification.media.INTENT_PLAYPAUSE";
-
     public static final String NOTIFICATION_INTENT_CANCEL = "co.mobiwise.library.notification.media.INTENT_CANCEL";
-
     public static final String NOTIFICATION_INTENT_OPEN_PLAYER = "co.mobiwise.library.notification.media.INTENT_OPENPLAYER";
-
+    /**
+     * Stop action. If another radioplayer will start.It needs
+     * to send broadcast to stop this service.
+     */
+    public static final String ACTION_RADIOPLAYER_STOP = "co.mobiwise.library.ACTION_STOP_RADIOPLAYER";
+    /**
+     * Notification ID
+     */
+    private static final int NOTIFICATION_ID = 001;
+    /**
+     * Binder
+     */
+    public final IBinder mLocalBinder = new LocalBinder();
+    /**
+     * Media listeners
+     */
+    List<MediaListener> mediaListenerList;
     /**
      * Notification current values
      */
@@ -52,61 +63,84 @@ public class MediaPlayerService extends Service implements
     private String songName = "";
     private int smallImage = R.drawable.default_art;
     private Bitmap artImage;
-
-    /**
-     * Player State Enum
-     */
-    public enum State {
-        IDLE,
-        PLAYING,
-        STOPPED,
-        PAUSED
-    }
-
-    /**
-     * Media listeners
-     */
-    List<MediaListener> mediaListenerList;
-
     /**
      * MediaPlayer State
      */
     private State mState = State.IDLE;
-
     /**
      * Music stream URL;
      */
     private String mStreamURL = "";
-
     /**
      * Notification manager
      */
     private NotificationManager mNotificationManager;
-
-    /**
-     * Stop action. If another radioplayer will start.It needs
-     * to send broadcast to stop this service.
-     */
-    public static final String ACTION_RADIOPLAYER_STOP = "co.mobiwise.library.ACTION_STOP_RADIOPLAYER";
-
     /**
      * Media Player
      */
     private MediaPlayer mediaPlayer;
 
-    /**
-     * Binder
-     */
-    public final IBinder mLocalBinder = new LocalBinder();
+    private TelephonyManager mTelephonyManager;
 
     /**
-     * Binder
+     * While current radio playing, if you give another play command with different
+     * source, you need to stop it first. This value is responsible for control
+     * after radio stopped.
      */
-    public class LocalBinder extends Binder {
-        public MediaPlayerService getService() {
-            return MediaPlayerService.this;
+    private boolean isSwitching;
+
+    /**
+     * If closed from notification, it will be checked
+     * on Stop method and notification will not be created
+     */
+    private boolean isClosedFromNotification = false;
+
+    /**
+     * Incoming calls interrupt radio if it is playing.
+     * Check if this is true or not after hang up;
+     */
+    private boolean isInterrupted;
+
+    private String mMediaUrl;
+
+
+    PhoneStateListener phoneStateListener = new PhoneStateListener() {
+        @Override
+        public void onCallStateChanged(int state, String incomingNumber) {
+            if (state == TelephonyManager.CALL_STATE_RINGING) {
+
+                /**
+                 * Stop radio and set interrupted if it is playing on incoming call.
+                 */
+                if (isPlaying()) {
+                    isInterrupted = true;
+                    stop();
+                }
+
+            } else if (state == TelephonyManager.CALL_STATE_IDLE) {
+
+                /**
+                 * Keep playing if it is interrupted.
+                 */
+                if (isInterrupted)
+                    play(mMediaUrl);
+
+            } else if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
+
+                /**
+                 * Stop radio and set interrupted if it is playing on outgoing call.
+                 */
+                if (isPlaying()) {
+                    isInterrupted = true;
+                    stop();
+                }
+
+            }
+            super.onCallStateChanged(state, incomingNumber);
         }
-    }
+    };
+
+
 
     /**
      * OnBind
@@ -133,13 +167,12 @@ public class MediaPlayerService extends Service implements
 
         String action = intent.getAction();
 
-        if(action.equals(NOTIFICATION_INTENT_CANCEL)){
-            if(isPlaying())
+        if (action.equals(NOTIFICATION_INTENT_CANCEL)) {
+            if (isPlaying())
                 stop();
             mNotificationManager.cancel(NOTIFICATION_ID);
-        }
-        else if(action.equals(NOTIFICATION_INTENT_PLAY_PAUSE)){
-            if(isPlaying())
+        } else if (action.equals(NOTIFICATION_INTENT_PLAY_PAUSE)) {
+            if (isPlaying())
                 pause();
             else
                 play(mStreamURL);
@@ -148,6 +181,7 @@ public class MediaPlayerService extends Service implements
 
         return START_NOT_STICKY;
     }
+
 
     /**
      * OnCreate
@@ -159,6 +193,12 @@ public class MediaPlayerService extends Service implements
         mNotificationManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         mediaListenerList = new ArrayList<>();
         initializeMediaPlayer();
+
+        mTelephonyManager = (TelephonyManager) getSystemService(TELEPHONY_SERVICE);
+        mNotificationManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+
+        if (mTelephonyManager != null)
+            mTelephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_CALL_STATE);
     }
 
     /**
@@ -185,7 +225,7 @@ public class MediaPlayerService extends Service implements
      * @param mStreamURL
      */
     public void play(String mStreamURL) {
-
+        this.mMediaUrl = mStreamURL;
         sendBroadcast(new Intent(ACTION_RADIOPLAYER_STOP));
 
         notifyPlayerLoading();
@@ -206,13 +246,13 @@ public class MediaPlayerService extends Service implements
         }
     }
 
-    public void resume(){
-        if(mStreamURL != null)
+    public void resume() {
+        if (mStreamURL != null)
             play(mStreamURL);
     }
 
-    public void stopFromNotification(){
-        if(mNotificationManager != null) mNotificationManager.cancelAll();
+    public void stopFromNotification() {
+        if (mNotificationManager != null) mNotificationManager.cancelAll();
         stop();
     }
 
@@ -255,6 +295,7 @@ public class MediaPlayerService extends Service implements
 
     /**
      * Called when mediaplayer prepared to play
+     *
      * @param mp
      */
     @Override
@@ -266,6 +307,7 @@ public class MediaPlayerService extends Service implements
 
     /**
      * Seek completed
+     *
      * @param mp
      */
     @Override
@@ -276,6 +318,7 @@ public class MediaPlayerService extends Service implements
 
     /**
      * End of file
+     *
      * @param mp
      */
     @Override
@@ -320,7 +363,7 @@ public class MediaPlayerService extends Service implements
     /**
      * Build notification
      */
-    private void buildNotification(){
+    private void buildNotification() {
 
         /**
          * Intents
@@ -332,9 +375,9 @@ public class MediaPlayerService extends Service implements
         /**
          * Pending intents
          */
-        PendingIntent playPausePending = PendingIntent.getBroadcast(this,100,intentPlayPause,0);
-        PendingIntent openPending = PendingIntent.getBroadcast(this,101,intentOpenPlayer,0);
-        PendingIntent cancelPending = PendingIntent.getBroadcast(this,102,intentCancel,0);
+        PendingIntent playPausePending = PendingIntent.getBroadcast(this, 100, intentPlayPause, 0);
+        PendingIntent openPending = PendingIntent.getBroadcast(this, 101, intentOpenPlayer, 0);
+        PendingIntent cancelPending = PendingIntent.getBroadcast(this, 102, intentCancel, 0);
 
         /**
          * Remote view for normal view
@@ -346,8 +389,8 @@ public class MediaPlayerService extends Service implements
         /**
          * set small notification texts and image
          */
-        if(artImage == null)
-            artImage = BitmapFactory.decodeResource(getResources(),R.drawable.default_art);
+        if (artImage == null)
+            artImage = BitmapFactory.decodeResource(getResources(), R.drawable.default_art);
 
         mNotificationTemplate.setTextViewText(R.id.notification_line_one, singerName);
         mNotificationTemplate.setTextViewText(R.id.notification_line_two, songName);
@@ -378,7 +421,7 @@ public class MediaPlayerService extends Service implements
          */
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
 
-            RemoteViews mExpandedView = new RemoteViews(this.getPackageName(),R.layout.notification_expanded);
+            RemoteViews mExpandedView = new RemoteViews(this.getPackageName(), R.layout.notification_expanded);
 
             mExpandedView.setTextViewText(R.id.notification_line_one, singerName);
             mExpandedView.setTextViewText(R.id.notification_line_two, songName);
@@ -391,23 +434,42 @@ public class MediaPlayerService extends Service implements
             notification.bigContentView = mExpandedView;
         }
 
-        if(mNotificationManager != null)
+        if (mNotificationManager != null)
             mNotificationManager.notify(NOTIFICATION_ID, notification);
     }
 
-    public void updateNotification(String singerName, String songName, int smallImage, int artImage){
+    public void updateNotification(String singerName, String songName, int smallImage, int artImage) {
         this.singerName = singerName;
         this.songName = songName;
         this.smallImage = smallImage;
-        this.artImage = BitmapFactory.decodeResource(getResources(),artImage);
+        this.artImage = BitmapFactory.decodeResource(getResources(), artImage);
         buildNotification();
     }
 
-    public void updateNotification(String singerName, String songName, int smallImage, Bitmap artImage){
+    public void updateNotification(String singerName, String songName, int smallImage, Bitmap artImage) {
         this.singerName = singerName;
         this.songName = songName;
         this.smallImage = smallImage;
         this.artImage = artImage;
         buildNotification();
+    }
+
+    /**
+     * Player State Enum
+     */
+    public enum State {
+        IDLE,
+        PLAYING,
+        STOPPED,
+        PAUSED
+    }
+
+    /**
+     * Binder
+     */
+    public class LocalBinder extends Binder {
+        public MediaPlayerService getService() {
+            return MediaPlayerService.this;
+        }
     }
 }
